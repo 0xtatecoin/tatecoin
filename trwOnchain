@@ -1,0 +1,229 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+interface IERC20 {
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+}
+
+interface IUniswapV2Router {
+    function swapTokensForExactTokens(
+        uint256 amountOut,
+        uint256 amountInMax,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
+
+    function WETH() external pure returns (address);
+
+    function getAmountsIn(uint256 amountOut, address[] calldata path)
+        external
+        view
+        returns (uint256[] memory amounts);
+}
+
+contract trwOnchain {
+    IERC20 public tatecoin;
+    IERC20 public linkToken;
+    IUniswapV2Router public uniswapRouter;
+    address public owner;
+    uint256 private earnings;
+    bool public isPortalOpen;
+    uint256 public linkAmount;
+
+    struct Investor {
+        uint256 amount;
+        bool exists;
+    }
+
+    mapping(address => Investor) private investors;
+    address[] private investorAddresses;
+    uint256 private totalInvested;
+
+    event InvestmentReceived(address indexed investor, uint256 amount);
+    event ProfitDistributed(uint256 totalEarnings, uint256 totalInvested);
+    event EmergencyWithdrawl(address indexed investor, uint256 amount);
+    event PortalClosed();
+    event PortalOpened();
+    event RefundAndResetExecuted();
+    event LinkAmountUpdated(uint256 newAmount);
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Not the contract owner");
+        _;
+    }
+
+    constructor(address _tatecoin, address _linkToken, address _uniswapRouter) {
+        tatecoin = IERC20(_tatecoin);
+        linkToken = IERC20(_linkToken);
+        uniswapRouter = IUniswapV2Router(_uniswapRouter);
+        owner = msg.sender;
+        isPortalOpen = true;
+        linkAmount = 1;
+    }
+
+    function setUniswapRouter(address _uniswapRouter) external onlyOwner {
+        uniswapRouter = IUniswapV2Router(_uniswapRouter);
+    }
+
+    function setLinkAmountToSwap(uint256 _linkAmount) external onlyOwner {
+        require(_linkAmount >= 0 && _linkAmount <= 5, "Amount must be between 0 and 5 LINK");
+        linkAmount = _linkAmount;
+        emit LinkAmountUpdated(_linkAmount);
+    }
+
+    function notifyTransfer(address from, address to, uint256 value) external {
+        require(msg.sender == address(tatecoin), "Only token can call this function");
+        earnings = tatecoin.balanceOf(address(this)) - totalInvested;
+
+        if (to == address(this)) {
+            require(isPortalOpen, "Portal is closed");
+            if (!investors[from].exists) {
+                investors[from] = Investor(value, true);
+                investorAddresses.push(from);
+            } else {
+                investors[from].amount += value;
+            }
+            totalInvested += value;
+            emit InvestmentReceived(from, value);
+        }
+        earnings = tatecoin.balanceOf(address(this)) - totalInvested;
+    }
+
+    function distributeProfits() external onlyOwner {
+        earnings = tatecoin.balanceOf(address(this)) - totalInvested;
+
+        require(totalInvested > 0, "No investments to distribute");
+
+        uint256 amountToSwap = getAmountToSwap();
+        if (earnings > (amountToSwap * 3) ){
+        swapTokensForLink(amountToSwap * 3); 
+        earnings = tatecoin.balanceOf(address(this)) - totalInvested;
+        }
+
+        for (uint256 i = 0; i < investorAddresses.length; i++) {
+            address investor = investorAddresses[i];
+            uint256 investorAmount = investors[investor].amount;
+            if (investorAmount > 0) {
+                uint256 profitShare = (investorAmount * earnings) / totalInvested;
+                require(tatecoin.transfer(investor, profitShare + investorAmount), "Profit distribution failed");
+                investors[investor].amount = 0;
+            }
+            investors[investor].exists = false;
+        }
+
+        earnings = 0;
+        totalInvested = 0;
+        delete investorAddresses;
+        emit ProfitDistributed(earnings, totalInvested);
+    }
+
+    function getAmountToSwap() internal view returns (uint256) {
+        address[] memory path = new address[](3);
+        path[0] = address(tatecoin);
+        path[1] = uniswapRouter.WETH();
+        path[2] = address(linkToken);
+
+        uint256[] memory amountsIn = uniswapRouter.getAmountsIn(linkAmount * 10**18, path);
+        return amountsIn[0];
+    }
+
+    function swapTokensForLink(uint256 amountInMax) internal {
+        address[] memory path = new address[](3);
+        path[0] = address(tatecoin);
+        path[1] = uniswapRouter.WETH();
+        path[2] = address(linkToken);
+
+        tatecoin.approve(address(uniswapRouter), amountInMax);
+
+        uniswapRouter.swapTokensForExactTokens(
+            linkAmount * 10**18, 
+            amountInMax, 
+            path,
+            owner,
+            block.timestamp + 360
+        );
+    }
+
+    function emergencyWithdraw() external {
+        earnings = tatecoin.balanceOf(address(this)) - totalInvested;
+
+        require(investors[msg.sender].exists, "No investment found");
+        uint256 investmentAmount = investors[msg.sender].amount;
+        uint256 penaltyAmount = (investmentAmount * 5) / 100;
+        uint256 amountToReturn = investmentAmount - penaltyAmount;
+
+        require(tatecoin.transfer(msg.sender, amountToReturn), "Transfer failed");
+
+        earnings += penaltyAmount;
+        totalInvested -= investmentAmount;
+        investors[msg.sender].amount = 0;
+        investors[msg.sender].exists = false;
+
+        for (uint256 i = 0; i < investorAddresses.length; i++) {
+            if (investorAddresses[i] == msg.sender) {
+                investorAddresses[i] = investorAddresses[investorAddresses.length - 1];
+                investorAddresses.pop();
+                break;
+            }
+        }
+
+        emit EmergencyWithdrawl(msg.sender, amountToReturn);
+    }
+
+    function refundAndReset() external onlyOwner {
+        for (uint256 i = 0; i < investorAddresses.length; i++) {
+            address investor = investorAddresses[i];
+            uint256 investorAmount = investors[investor].amount;
+            require(tatecoin.transfer(investor, investorAmount), "Refund failed");
+            investors[investor].amount = 0;
+            investors[investor].exists = false;
+        }
+
+        totalInvested = 0;
+        delete investorAddresses;
+        emit RefundAndResetExecuted();
+    }
+
+    function myProfitShare() external view returns (uint256) {
+        if (totalInvested == 0 || !investors[msg.sender].exists) {
+            return 0;
+        }
+        uint256 currentEarnings = tatecoin.balanceOf(address(this)) - totalInvested;
+        uint256 profitShare = (investors[msg.sender].amount * currentEarnings) / totalInvested;
+        return profitShare / 10**18; // Convert from wei to Ether
+    }
+
+    function totalEarnings() external view returns (uint256) {
+        return earnings / 10**18;
+    }
+
+    function totalInvestment() external view returns (uint256) {
+        return totalInvested / 10**18;
+    }
+
+    function yourInvestmentAmount() external view returns (uint256) {
+        return investors[msg.sender].amount / 10**18;
+    }
+
+    function totalInvestors() external view returns (uint256) {
+        return investorAddresses.length;
+    }
+
+    function closePortal() external onlyOwner {
+        isPortalOpen = false;
+        emit PortalClosed();
+    }
+
+    function openPortal() external onlyOwner {
+        isPortalOpen = true;
+        emit PortalOpened();
+    }
+}
